@@ -76,7 +76,7 @@ DesiredCount
 MinCapacity
 MaxCapacity
 ```
-Here is an example of creating stack with a more parameters:
+Here is an example of creating stack with more parameters:
 ```
 aws cloudformation create-stack --stack-name MozioFargate \
   --template-body file://deploy_mozio_app.yaml \
@@ -99,9 +99,7 @@ Monitor the stack creation process:
 aws cloudformation describe-stacks --stack-name MozioFargate
 ```
 
-Verify the parameters and check `StackStatus` field for the status
-
-Alternatively, check the AWS CloudFormation console for status updates.
+Verify the parameters and check `StackStatus` field for the status. Alternatively, check the AWS CloudFormation console for status updates.
 
 #### Step 4: Access the Deployed Application
 Once the stack is successfully deployed, retrieve the ALB's DNS name to access the application:
