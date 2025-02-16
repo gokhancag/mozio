@@ -40,7 +40,7 @@ docker tag hello-mozio:latest 794038229667.dkr.ecr.us-east-1.amazonaws.com/mozio
 ```
 * Push image to ECR:
 ```
-docker push 794038229667.dkr.ecr.us-east-1.amazonaws.com/mozio
+docker push 794038229667.dkr.ecr.us-east-1.amazonaws.com/mozio:latest
 ```
 
 Image will now be available in AWS ECR repository.
