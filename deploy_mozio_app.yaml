@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template for ECS Fargate with ALB, VPC, and auto-scaling.
+
+Parameters:
+  # VPC is the logically isolated virtual network in which all resources will run.
+  VpcCidr:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16 # Resources will have their IPs within this /16 subnet
+
+  # We need to use 2 Public and 2 Private Subnets for load balancing purposes.
+  # Public subnets will be routed over IGW (Internet Gateway), Private subnets will be routed over NAT Gateway
+  PublicSubnet1Cidr:
+    Description: CIDR block for the first public subnet
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Description: CIDR block for the second public subnet
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1Cidr:
+    Description: CIDR block for the first private subnet
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet2Cidr:
+    Description: CIDR block for the second private subnet
+    Type: String
+    Default: 10.0.4.0/24
+
+  ContainerImage:
+    Description: Docker image for the ECS task
+    Type: String
+    Default: nginx:latest # If no parameter is submitted during stack creation, nginx image will be used by default.
+
+  DesiredCount:
+    Description: Desired number of ECS tasks
+    Type: Number
+    Default: 2
+
+  MinCapacity:
+    Description: Minimum number of ECS tasks for auto-scaling
+    Type: Number
+    Default: 2
+
+  MaxCapacity:
+    Description: Maximum number of ECS tasks for auto-scaling
+    Type: Number
+    Default: 4
+
+Resources:
+# Get the VPC CIDR to be used for networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  # Subnets need to be in different Availability Zones for high availability of the application
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs "" ]  # Set Availability Zone
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs "" ]  # Set Availability Zone
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs "" ]  # Set Availability Zone
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs "" ]  # Set Availability Zone
+
+  # Internet Gateway (IGW) allows instances with public IPs to access the internet.
+  # We need create IGW and attach it to VPC. Then we will create Route Table and routes (Destination CIDR) for internet access.
+  # Finally, we're going to associate Public Subnets to IGW
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway (NGW) allows instances with no public IPs (Private Subnets) to access the internet but only works "one way".
+  # Instances in a private subnet can connect to services outside the VPC but external services cannot initiate a connection with those instances (one way)
+  # Add a NAT Gateway in the public subnet
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  # Allocate an Elastic IP for the NAT Gateway
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Add a route table for the private subnets
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  # Add a route to the NAT Gateway for internet access
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # Associate the private subnets with the private route table
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ECS is Elastic Container Service of AWS to run containers 
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: MozioECSCluster
+  
+  # Define the container properties to run inside ECS (ECS Tasks)
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: mozio-task
+      NetworkMode: awsvpc
+      Cpu: '1024' # Each container will have 1vCPU
+      Memory: '2048' # Each container will have 2GB RAM
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: mozio
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mozio
+
+  # Specifies a target group for an Application Load Balancer
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+
+  # Create Application Load Balancer (ALB) by specifying Public Subnets
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  # Defines the port and protocol which ALB will listen
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ECSTargetGroup
+
+  # Creates ingress and/or egress security groups. ALB will receive/send traffic from/to specified IP address(es)
+  # It is possible to set Protocol, Port or IP for ALB access. ALB will only be able to receive/send traffic from/to specified rules.
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Defines security group for ECS cluster for ingress and/or egress direction.
+  # It is important to set Egress port to 443 since ECS can only pull container images via HTTPS.
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Defines the IAM roles for ECS to be able to pull images from ECR (Container Registry of AWS)
+  # Setting missing/wrong "Actions" (IAM roles) below will result "Image Pull Error" on ECS side.
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSTaskExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Enables application logging on CloudWatch side. 
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/mozio
+      RetentionInDays: 7
+
+  # Defines ECS service details. Implements rolling deployment strategy of specified container image to minimize downtime during updates.
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: mozio
+          ContainerPort: 80
+          TargetGroupArn: !Ref ECSTargetGroup
+
+  # Enables Auto-Scaling of containers in ECS. New containers will be created based on MinCapacity and MaxCapacity values.
+  # MinCapacity and MaxCapacity are the number of containers for scaling and defined as parameter.
+  ECSServiceAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Join ["/", ["service", !Ref ECSCluster, !GetAtt ECSService.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt ECSScalingRole.Arn
+
+  # Creates IAM Role for autoscaling functionality.
+  ECSScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSScalingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: !Ref ECSService
+
+  # Creates CPU alarm. A CloudWatch alarm will be triggered if average CPU utilization exceeds 80% for 5 minutes.
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Mozio ECS - High CPU Utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+
+   # Creates Memory alarm. A CloudWatch alarm will be triggered if memory usage exceeds 75%.
+  MemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Mozio ECS - High Memory Utilization
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name  
+
+
+# DNS name of ALB (can be used as application URL) will be printed when no error occurs during stack creation.
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ALB.DNSName
