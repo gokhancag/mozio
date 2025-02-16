@@ -50,7 +50,7 @@ Image will now be available in AWS ECR repository.
 #### Step 1: Validate the CloudFormation Template
 Before deploying, validate the template to ensure it has no syntax errors:
 ```
-aws cloudformation validate-template --template-body file://deploy_mozio_app.yaml`
+aws cloudformation validate-template --template-body file://deploy_mozio_app.yaml
 ```
 
 #### Step 2: Deploy the CloudFormation Stack
